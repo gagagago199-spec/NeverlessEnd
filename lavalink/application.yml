@@ -6,8 +6,8 @@ server:
 
 lavalink:
   plugins:
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
-      snapshot: false
+    - dependency: "dev.lavalink.youtube:youtube-plugin:e41dd95f8bd134b51e75080fb28cc805fecb431a"
+      snapshot: true
   server:
     password: "${LAVALINK_SERVER_PASSWORD:change-me}"
     sources:
@@ -51,6 +51,7 @@ plugins:
     allowDirectPlaylistIds: true
     clients:
       - MUSIC
+      - TV
       - WEB
       - MWEB
       - WEBEMBEDDED
