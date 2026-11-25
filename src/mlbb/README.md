@@ -24,7 +24,7 @@ The public ranked API's win, pick and ban rates are statistical associations, no
 
 ## Persistence & security
 
-Records are compressed and stored one per player in the existing private `neverless-data` Discord channel, with a local fallback file in `DATA_DIR`. Channel permissions are checked; it refuses to write records if `@everyone` can view the channel. On Railway the local filesystem is ephemeral, so persistent storage requires the private data channel. `/mlbb unlink` removes the record. Public profile sharing is off by default. Do not grant untrusted roles access to the internal data channel. Keep `Rone Arena` login confirmations ephemeral, and never send game passwords, OTPs or JWTs to public channels.
+Records are compressed and stored one per player in the dedicated private `neverless-mlbb-data` Discord channel, with a local fallback file in `DATA_DIR`. Channel permissions are checked; it refuses to write records if `@everyone` can view the channel. On Railway the local filesystem is ephemeral, so persistent storage requires the private data channel. `/mlbb unlink` removes the record. Public profile sharing is off by default. Do not grant untrusted roles access to the internal data channel. Keep `Rone Arena` login confirmations ephemeral, and never send game passwords, OTPs or JWTs to public channels.
 
 ## Validation
 
@@ -38,4 +38,4 @@ node --check src/mlbb/data.js
 
 ### Troubleshooting
 
-If slash commands do not appear, verify `NeverlessEnd` is online and that `Registered ... commands` logged on guild startup. If online hero endpoints fail, the API may be unavailable; self-reported commands, coaching and quizzes still work. If persistence warns about `No Neverless private data channel`, check Genshin's `neverless-data` channel and privacy permissions.
+If slash commands do not appear, verify `NeverlessEnd` is online and that `Registered ... commands` logged on guild startup. If online hero endpoints fail, the API may be unavailable; self-reported commands, coaching and quizzes still work. If persistence warns about `No private MLBB data channel`, give the main bot Manage Channels permission to create a private `neverless-mlbb-data` channel. If creation fails, the local fallback is ephemeral on Railway.
