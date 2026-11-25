@@ -5,6 +5,7 @@ const {
   PermissionFlagsBits,
   SlashCommandBuilder,
 } = require('discord.js');
+const {mlbbSlash}=require('./mlbb/commands');
 
 function addDurationAndReason(command) {
   return command
@@ -13,6 +14,7 @@ function addDurationAndReason(command) {
 }
 
 const commands = [
+  mlbbSlash,
   new SlashCommandBuilder()
     .setName('welcome')
     .setDescription('تحديد روم الترحيب بالأعضاء الجدد')

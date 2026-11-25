@@ -1,0 +1,11 @@
+'use strict';
+const assert=require('node:assert/strict');
+const test=require('node:test');
+const c=require('./core');
+test('validates role and zone',()=>{assert(c.validPlayerId('123456789'));assert(!c.validPlayerId('abc'));assert(c.validZone('1234'));assert(!c.validZone('1'))});
+test('win rate formula handles exact targets and impossible inputs',()=>{assert.equal(c.winsToTarget(40,100,50),20);assert.equal(c.winsToTarget(60,100,50),0);assert.equal(c.winsToTarget(44,100,60),40);assert.equal(c.winsToTarget(101,100,60),null);assert.equal(c.winsToTarget(5,10,100),null);});
+test('rating is confidence-aware and never claims unknown data',()=>{assert.equal(c.calculateRating({}).score,null);let d={stats:{matches:100,wins:70,rank:'immortal'},matches:[]};assert.equal(c.calculateRating(d).coverage,60);assert(c.calculateRating(d).score<=100);let e={stats:{matches:1,wins:1},matches:[]};assert.equal(c.calculateRating(e).score,null);});
+test('match coach and challenge are deterministic',()=>{const m={hero:'Kagura',role:'mid',result:'win',kills:4,deaths:3,assists:9,date:'2026-11-26T05:00:00Z'};assert.equal(c.matchAnalysis(m).kda,4.33);const d={matches:[m],stats:{role:'mid'}};assert.equal(c.coaching(d).role,'mid');assert.deepEqual(c.dailyChallenge('123456789123456789','2026-11-26'),c.dailyChallenge('123456789123456789','2026-11-26'));const p=c.challengeProgress(d,'123456789123456789','2026-11-26');assert(p.progress<=p.target);});
+test('hero roulette matches selected role',()=>{assert.equal(c.chooseHero('mid',['Kagura'],()=>0),'Kagura');assert(c.FALLBACK_HEROES.gold.length>=10);});
+test('quiz has three choices and exactly one correct answer',()=>{for(const q of c.QUIZZES){assert.equal(q.choices.length,3);assert(Number.isInteger(q.correct)&&q.correct>=0&&q.correct<3);}});
+test('collection score does not claim a sale price',()=>{const r=c.rateCollection({heroes:100,skins:250,collector:12,legend:5,epic:80});assert(r.score>0&&r.score<=100);});
