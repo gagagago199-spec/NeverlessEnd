@@ -50,12 +50,31 @@ async function writeLocal(){
 async function init(client){
   ready=(async()=>{
     try{let raw=JSON.parse(await fs.promises.readFile(FILE,'utf8'));for(const [id,value] of Object.entries(raw||{})){if(/^\d{15,22}$/.test(id))users.set(id,normalizeRecord(value));}}catch{}
+    // Keep MLBB profiles in their own private channel rather than scanning the
+    // existing (potentially large) Genshin account archive on every startup.
     const guilds=[...client.guilds.cache.values()];
     for(const g of guilds){
-      const found=g.channels.cache.find(x=>x.name==='neverless-data'&&x.type===ChannelType.GuildText);
+      const found=g.channels.cache.find(x=>x.name==='neverless-mlbb-data'&&x.type===ChannelType.GuildText);
       if(found){channel=found;break;}
     }
-    if(!channel){console.warn('[mlbb] No Neverless private data channel: local fallback only');return;}
+    if(!channel){
+      for(const g of guilds){
+        if(!g.members.me?.permissions.has(PermissionFlagsBits.ManageChannels))continue;
+        try{
+          channel=await g.channels.create({
+            name:'neverless-mlbb-data',type:ChannelType.GuildText,
+            topic:'NeverLess MLBB private player profiles. Do not delete.',
+            permissionOverwrites:[
+              {id:g.roles.everyone.id,deny:[PermissionFlagsBits.ViewChannel]},
+              {id:client.user.id,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.ReadMessageHistory,PermissionFlagsBits.ManageMessages]},
+            ],
+            reason:'NeverLess MLBB private persistent profiles',
+          });
+          break;
+        }catch(err){console.warn('[mlbb] Cannot create private data channel:',err.message);}
+      }
+    }
+    if(!channel){console.warn('[mlbb] No private MLBB data channel: local fallback only');return;}
     if(channel.permissionsFor(channel.guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel)){
       channel=null;console.warn('[mlbb] Data channel is public; refusing to write player records');return;
     }
@@ -73,7 +92,7 @@ async function init(client){
         }
         loaded+=batch.size;before=batch.last()?.id;
         if(batch.size<100)break;
-      }while(loaded<3000);
+      }while(loaded<1500);
       for(const [id,rec] of loadedRecords){users.set(id,rec.data);}
       isPersistent=true;
       console.log(`[mlbb] loaded ${loadedRecords.size} profiles from private Discord data`);
