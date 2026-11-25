@@ -4,7 +4,6 @@ const path=require('node:path');
 const zlib=require('node:zlib');
 const {ChannelType,PermissionFlagsBits}=require('discord.js');
 const {DATA_DIR}=require('../store');
-const {whenAccountStoreReady}=require('../genshin/accountStore');
 const PREFIX='NLMLBB1|';
 const FILE=path.join(DATA_DIR,'mlbb-profiles.json');
 const users=new Map(),messageIds=new Map(),queues=new Map();
@@ -51,7 +50,6 @@ async function writeLocal(){
 async function init(client){
   ready=(async()=>{
     try{let raw=JSON.parse(await fs.promises.readFile(FILE,'utf8'));for(const [id,value] of Object.entries(raw||{})){if(/^\d{15,22}$/.test(id))users.set(id,normalizeRecord(value));}}catch{}
-    await whenAccountStoreReady();
     const guilds=[...client.guilds.cache.values()];
     for(const g of guilds){
       const found=g.channels.cache.find(x=>x.name==='neverless-data'&&x.type===ChannelType.GuildText);
