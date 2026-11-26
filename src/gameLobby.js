@@ -223,13 +223,26 @@ async function persistLobby(guild, lobby) {
 }
 
 async function deletePersistedLobby(guild, lobby) {
+  // Tombstones prevent previously deleted rooms from reappearing after reboot.
+  // Editing an existing message also preserves deletion if a new send fails.
   const key = lobbyKey(lobby.guildId, lobby.id);
   const channel = dataChannel(guild);
-  const messageId = stateMessageIds.get(key);
+  if (!channel) {
+    console.error('[game-lobby] CANNOT SAVE DELETION; neverless-data unavailable for ' + lobby.id);
+    return false;
+  }
+  const deletedState = { id: lobby.id, guildId: lobby.guildId, deleted: true, closedAt: Date.now() };
+  const content = STATE_PREFIX + lobby.guildId + '|' + lobby.id + '|'
+    + zlib.deflateRawSync(Buffer.from(JSON.stringify(deletedState), 'utf8'), { level: 9 }).toString('base64url');
+  const knownId = stateMessageIds.get(key);
+  let message = knownId ? await channel.messages.fetch(knownId).catch(() => null) : null;
+  if (message) {
+    try { await message.edit(content); }
+    catch { message = null; }
+  }
+  if (!message) message = await channel.send(content);
   stateMessageIds.delete(key);
-  if (!channel || !messageId) return;
-  const message = await channel.messages.fetch(messageId).catch(() => null);
-  if (message) await message.delete().catch(() => {});
+  return true;
 }
 
 function panelEmbed() {
@@ -592,11 +605,12 @@ async function addMemberToLobby(guild, lobby, userId, uid, server) {
 }
 
 async function destroyLobby(guild, lobby) {
+  if (lobbies.get(lobby.id) !== lobby) return;
   lobbies.delete(lobby.id);
   for (const request of lobby.pending || []) pendingInteractions.delete(request.id);
   const text = guild.channels.cache.get(lobby.textChannelId) || await guild.channels.fetch(lobby.textChannelId).catch(() => null);
   const voice = guild.channels.cache.get(lobby.voiceChannelId) || await guild.channels.fetch(lobby.voiceChannelId).catch(() => null);
-  await deletePersistedLobby(guild, lobby).catch(() => {});
+  await deletePersistedLobby(guild, lobby).catch((error) => console.error('[game-lobby] Failed to persist lobby closure:', error));
   if (voice) await voice.delete('Neverless lobby empty').catch(() => {});
   if (text) await text.delete('Neverless lobby empty').catch(() => {});
   await refreshFinderViews(guild).catch(() => {});
@@ -1118,10 +1132,59 @@ async function restorePermissions(guild, client, lobby) {
   }
 }
 
+async function channelStatus(guild, id) {
+  if (!id) return { channel: null, missing: true };
+  const cached = guild.channels.cache.get(id);
+  if (cached) return { channel: cached, missing: false };
+  try {
+    const channel = await guild.channels.fetch(id);
+    return { channel, missing: !channel };
+  } catch (error) {
+    // 10003 = Unknown Channel; never delete on network or permission errors.
+    return { channel: null, missing: Number(error?.code) === 10003 };
+  }
+}
+
+async function reconcileGuildLobbies(guild) {
+  const key = String(guild.id);
+  if (reconcileInFlight.has(key)) return reconcileInFlight.get(key);
+  const task = (async () => {
+    for (const lobby of guildLobbies(key)) {
+      if (lobbies.get(lobby.id) !== lobby) continue;
+      const [text, voice] = await Promise.all([
+        channelStatus(guild, lobby.textChannelId), channelStatus(guild, lobby.voiceChannelId),
+      ]);
+      if (text.missing || voice.missing) {
+        await destroyLobby(guild, lobby);
+        continue;
+      }
+      for (const row of [...lobby.members]) {
+        if (lobbies.get(lobby.id) !== lobby) break;
+        const member = await guild.members.fetch(row.userId).catch(() => null);
+        if (!member) await leaveLobby(guild, lobby, row.userId);
+      }
+    }
+  })();
+  reconcileInFlight.set(key, task);
+  try { await task; } finally { reconcileInFlight.delete(key); }
+}
+
 async function restoreLobby(guild, client, lobby) {
+  const [text, voice] = await Promise.all([
+    channelStatus(guild, lobby.textChannelId), channelStatus(guild, lobby.voiceChannelId),
+  ]);
+  if (text.missing || voice.missing) {
+    // A moderator deleted a channel while the bot was offline. Close, don't recreate.
+    await destroyLobby(guild, lobby);
+    return;
+  }
+  if (!text.channel || !voice.channel) {
+    console.warn('[game-lobby] Cannot verify channels, keeping persisted state: ' + lobby.id);
+    return;
+  }
   const validMembers = [];
   for (const row of lobby.members) {
-    const member = guild.members.cache.get(row.userId) || await guild.members.fetch(row.userId).catch(() => null);
+    const member = await guild.members.fetch(row.userId).catch(() => null);
     if (member) validMembers.push(row);
   }
   lobby.members = validMembers;
@@ -1130,17 +1193,7 @@ async function restoreLobby(guild, client, lobby) {
     return;
   }
   if (!lobby.members.some((row) => row.userId === lobby.ownerId)) {
-    lobby.ownerId = [...lobby.members].sort((a, b) => Number(a.joinedAt) - Number(b.joinedAt))[0].userId;
-  }
-
-  let text = lobby.textChannelId ? await guild.channels.fetch(lobby.textChannelId).catch(() => null) : null;
-  let voice = lobby.voiceChannelId ? await guild.channels.fetch(lobby.voiceChannelId).catch(() => null) : null;
-  if (!text || !voice) {
-    if (text) await text.delete('Rebuilding incomplete Neverless lobby').catch(() => {});
-    if (voice) await voice.delete('Rebuilding incomplete Neverless lobby').catch(() => {});
-    const owner = guild.members.cache.get(lobby.ownerId) || await guild.members.fetch(lobby.ownerId).catch(() => null);
-    const ownerName = owner?.displayName || owner?.user?.username || `Lobby ${lobby.id.slice(0, 6)}`;
-    await createLobbyChannels(guild, client, lobby, ownerName);
+    lobby.ownerId = [...lobby.members].sort((a,b) => Number(a.joinedAt) - Number(b.joinedAt))[0].userId;
   }
   await restorePermissions(guild, client, lobby);
   await refreshControl(guild, lobby);
@@ -1153,15 +1206,18 @@ async function loadGuildLobbies(guild, client) {
   if (!channel) return;
   const messages = await fetchAllMessages(channel);
   const latest = new Map();
+  const tombstones = new Set();
   for (const message of messages) {
     if (message.author?.id !== client.user?.id) continue;
     const parsed = parseState(message.content);
     if (!parsed || parsed.guildId !== guild.id) continue;
     const key = lobbyKey(parsed.guildId, parsed.id);
+    if (parsed.deleted) { tombstones.add(key); continue; }
     const previous = latest.get(key);
     if (!previous || message.createdTimestamp > previous.createdTimestamp) latest.set(key, { parsed, message });
   }
   for (const [key, row] of latest) {
+    if (tombstones.has(key)) continue;
     const lobby = sanitizeLobby(row.parsed);
     if (!lobby) continue;
     lobbies.set(lobby.id, lobby);
@@ -1177,9 +1233,19 @@ async function restoreAll(client) {
 }
 
 async function handleGuildMemberRemove(member) {
-  const lobby = memberLobby(member.guild.id, member.id);
-  if (!lobby) return;
-  await leaveLobby(member.guild, lobby, member.id);
+  const matching = guildLobbies(member.guild.id).filter((lobby) =>
+    lobby.members.some((row) => row.userId === member.id));
+  for (const lobby of matching) {
+    if (lobbies.get(lobby.id) === lobby) await leaveLobby(member.guild, lobby, member.id);
+  }
+}
+async function handleLobbyChannelDelete(channel) {
+  if (!channel?.guild?.id) return;
+  const matching = guildLobbies(channel.guild.id).filter((lobby) =>
+    lobby.textChannelId === channel.id || lobby.voiceChannelId === channel.id);
+  for (const lobby of matching) {
+    if (lobbies.get(lobby.id) === lobby) await destroyLobby(channel.guild, lobby);
+  }
 }
 
 function installGameLobby(client) {
@@ -1194,7 +1260,10 @@ function installGameLobby(client) {
   client.on('guildMemberRemove', (member) => {
     handleGuildMemberRemove(member).catch((error) => console.error('[game-lobby] member remove failed:', error));
   });
-  console.log('[game-lobby] Independent Genshin lobby system installed.');
+  client.on('channelDelete', (channel) => {
+    handleLobbyChannelDelete(channel).catch((error) => console.error('[game-lobby] channel cleanup failed:', error));
+  });
+  console.log('[game-lobby] Genshin and Minecraft lobbies installed with server-owner moderation.');
 }
 
 module.exports = {
