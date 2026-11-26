@@ -919,8 +919,9 @@ async function handleInteraction(interaction, client) {
       await interaction.reply({ content: 'إدارة جميع اللوبيات لمالك السيرفر فقط.', ephemeral: true });
       return true;
     }
+    await interaction.deferReply({ ephemeral: true });
     await reconcileGuildLobbies(interaction.guild);
-    await interaction.reply({ ...adminPayload(interaction.guild), ephemeral: true });
+    await interaction.editReply(adminPayload(interaction.guild));
     return true;
   }
   const adminNav = interaction.isButton?.() && interaction.customId.match(/^nll:admin-page:(\d+)$/);
@@ -929,8 +930,9 @@ async function handleInteraction(interaction, client) {
       await interaction.reply({ content: 'إدارة اللوبيات لمالك السيرفر فقط.', ephemeral: true });
       return true;
     }
+    await interaction.deferUpdate();
     await reconcileGuildLobbies(interaction.guild);
-    await interaction.update(adminPayload(interaction.guild, adminNav ? Number(adminNav[1]) : 0));
+    await interaction.editReply(adminPayload(interaction.guild, adminNav ? Number(adminNav[1]) : 0));
     return true;
   }
   if (interaction.isStringSelectMenu?.() && interaction.customId === 'nll:admin-select') {
@@ -976,7 +978,6 @@ async function handleInteraction(interaction, client) {
   const createBtn = interaction.isButton?.() && interaction.customId.match(/^nll:create(?::(genshin|minecraft))?$/);
   if (createBtn) {
     const game = createBtn[1] || 'genshin';
-    await reconcileGuildLobbies(interaction.guild);
     const existing = memberLobby(interaction.guildId, interaction.user.id, game);
     if (existing) {
       await interaction.reply({ content: 'أنت موجود بالفعل في <#' + existing.textChannelId + '>. اخرج منه أولاً.', ephemeral: true });
@@ -992,23 +993,24 @@ async function handleInteraction(interaction, client) {
   const findBtn = interaction.isButton?.() && interaction.customId.match(/^nll:find(?::(genshin|minecraft))?$/);
   if (findBtn) {
     const game = findBtn[1] || 'genshin';
+    await interaction.deferReply({ ephemeral: true });
     await reconcileGuildLobbies(interaction.guild);
-    await interaction.reply({ ...findPayload(interaction.guild, game), ephemeral: true });
+    await interaction.editReply(findPayload(interaction.guild, game));
     rememberFinderView(interaction, game);
     return true;
   }
   const findRefresh = interaction.isButton?.() && interaction.customId.match(/^nll:find-refresh(?::(genshin|minecraft))?$/);
   if (findRefresh) {
     const game = findRefresh[1] || 'genshin';
+    await interaction.deferUpdate();
     await reconcileGuildLobbies(interaction.guild);
-    await interaction.update(findPayload(interaction.guild, game));
+    await interaction.editReply(findPayload(interaction.guild, game));
     rememberFinderView(interaction, game);
     return true;
   }
   const findSelect = interaction.isStringSelectMenu?.() && interaction.customId.match(/^nll:find-select(?::(genshin|minecraft))?$/);
   if (findSelect) {
     const game = findSelect[1] || 'genshin';
-    await reconcileGuildLobbies(interaction.guild);
     const id = interaction.values[0];
     if (id === 'none') {
       await interaction.reply({ content: 'لا توجد لوبيات متاحة.', ephemeral: true });
@@ -1145,6 +1147,17 @@ async function channelStatus(guild, id) {
   }
 }
 
+async function currentGuildMember(guild, id) {
+  try {
+    const member = await guild.members.fetch({ user: id, force: true });
+    return { member, absent: !member };
+  } catch (error) {
+    // Only remove on a definite Discord Unknown Member response.
+    // Transient API/network/permissions problems must never destroy a lobby.
+    return { member: null, absent: Number(error?.code) === 10007 };
+  }
+}
+
 async function reconcileGuildLobbies(guild) {
   const key = String(guild.id);
   if (reconcileInFlight.has(key)) return reconcileInFlight.get(key);
@@ -1160,8 +1173,8 @@ async function reconcileGuildLobbies(guild) {
       }
       for (const row of [...lobby.members]) {
         if (lobbies.get(lobby.id) !== lobby) break;
-        const member = await guild.members.fetch(row.userId).catch(() => null);
-        if (!member) await leaveLobby(guild, lobby, row.userId);
+        const lookup = await currentGuildMember(guild, row.userId);
+        if (lookup.absent) await leaveLobby(guild, lobby, row.userId);
       }
     }
   })();
@@ -1184,8 +1197,8 @@ async function restoreLobby(guild, client, lobby) {
   }
   const validMembers = [];
   for (const row of lobby.members) {
-    const member = await guild.members.fetch(row.userId).catch(() => null);
-    if (member) validMembers.push(row);
+    const lookup = await currentGuildMember(guild, row.userId);
+    if (!lookup.absent) validMembers.push(row);
   }
   lobby.members = validMembers;
   if (!lobby.members.length) {
