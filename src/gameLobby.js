@@ -493,6 +493,40 @@ function findPayload(guild, game = 'genshin') {
   };
 }
 
+function adminPayload(guild, page = 0) {
+  const list = guildLobbies(guild.id).sort((a,b) => b.createdAt - a.createdAt);
+  const lastPage = Math.max(0, Math.ceil(list.length / 25) - 1);
+  const p = Math.max(0, Math.min(lastPage, Number(page) || 0));
+  const chunk = list.slice(p * 25, (p + 1) * 25);
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('nll:admin-select')
+    .setPlaceholder(chunk.length ? 'Select lobby to close' : 'No active lobbies')
+    .setDisabled(!chunk.length)
+    .addOptions(chunk.length ? chunk.map((lobby) => ({
+      label: gameLabel(lobby.game) + ' • ' + lobby.id.slice(0, 8),
+      value: lobby.id,
+      description: ('Owner ' + lobby.ownerId + ' • ' + lobby.members.length + '/' + lobby.limit).slice(0, 100),
+    })) : [{ label: 'No active lobbies', value: 'none' }]);
+  return { embeds: [new EmbedBuilder().setColor(0xe0a14d)
+      .setTitle('Manage Lobbies • Server Owner')
+      .setDescription('لوبيات السيرفر المسجلة: **' + list.length + '**. اختر اللوبي الذي تريد إغلاقه.')],
+    components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.max(0, p - 1)).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(p === 0),
+      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.min(lastPage, p + 1)).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(p === lastPage),
+      new ButtonBuilder().setCustomId('nll:admin-refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+    )] };
+}
+
+function closeConfirmation(lobby, byAdmin = false) {
+  return { content: 'تأكيد إغلاق لوبي **' + gameLabel(lobby.game) + '** برقم **' + lobby.id
+      + '**؟ سيحذف البوت قنوات اللوبي وسجله في Find Lobby.',
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId((byAdmin ? 'nll:admin-close:' : 'nll:owner-close:') + lobby.id)
+        .setLabel('Confirm Close').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('nll:close-cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    )], allowedMentions: { parse: [] } };
+}
+
 function finderViewKey(interaction) {
   return `${interaction.guildId}:${interaction.user.id}`;
 }
@@ -857,53 +891,121 @@ async function handleInteraction(interaction, client) {
   if (!interaction.guild || !interaction.customId?.startsWith('nll:')) return false;
 
   if (interaction.isStringSelectMenu?.() && interaction.customId === 'nll:game') {
-    if (interaction.values[0] !== 'genshin') return true;
-    await interaction.reply({ ...gameMenuPayload(), ephemeral: true });
+    const game = interaction.values[0];
+    if (!['genshin', 'minecraft'].includes(game)) return true;
+    await interaction.reply({ ...gameMenuPayload(game), ephemeral: true });
     return true;
   }
   if (interaction.isButton?.() && interaction.customId === 'nll:panel-refresh') {
     await interaction.update({ embeds: [panelEmbed()], components: panelComponents() });
     return true;
   }
-  if (interaction.isButton?.() && interaction.customId === 'nll:game-refresh') {
-    await interaction.update(gameMenuPayload());
-    return true;
-  }
-  if (interaction.isButton?.() && interaction.customId === 'nll:create') {
-    const existing = memberLobby(interaction.guildId, interaction.user.id);
-    if (existing) {
-      await interaction.reply({ content: `أنت موجود بالفعل في <#${existing.textChannelId}>. اخرج منه أولًا.`, ephemeral: true });
+  if (interaction.isButton?.() && interaction.customId === 'nll:admin') {
+    if (!canAdminister(interaction.guild, interaction.user.id)) {
+      await interaction.reply({ content: 'إدارة جميع اللوبيات لمالك السيرفر فقط.', ephemeral: true });
       return true;
     }
-    await interaction.showModal(profileModal('nll:create-modal', 'Create Genshin Lobby'));
+    await reconcileGuildLobbies(interaction.guild);
+    await interaction.reply({ ...adminPayload(interaction.guild), ephemeral: true });
     return true;
   }
-  if (interaction.isModalSubmit?.() && interaction.customId === 'nll:create-modal') {
+  const adminNav = interaction.isButton?.() && interaction.customId.match(/^nll:admin-page:(\d+)$/);
+  if (interaction.isButton?.() && (interaction.customId === 'nll:admin-refresh' || adminNav)) {
+    if (!canAdminister(interaction.guild, interaction.user.id)) {
+      await interaction.reply({ content: 'إدارة اللوبيات لمالك السيرفر فقط.', ephemeral: true });
+      return true;
+    }
+    await reconcileGuildLobbies(interaction.guild);
+    await interaction.update(adminPayload(interaction.guild, adminNav ? Number(adminNav[1]) : 0));
+    return true;
+  }
+  if (interaction.isStringSelectMenu?.() && interaction.customId === 'nll:admin-select') {
+    if (!canAdminister(interaction.guild, interaction.user.id)) {
+      await interaction.reply({ content: 'إدارة اللوبيات لمالك السيرفر فقط.', ephemeral: true });
+      return true;
+    }
+    const lobby = lobbies.get(interaction.values[0]);
+    if (!lobby || lobby.guildId !== interaction.guildId) {
+      await interaction.update({ content: 'اللوبي لم يعد موجوداً. اضغط Manage Lobbies مرة أخرى.', embeds: [], components: [] });
+      return true;
+    }
+    await interaction.update({ ...closeConfirmation(lobby, true), embeds: [] });
+    return true;
+  }
+  if (interaction.isButton?.() && interaction.customId === 'nll:close-cancel') {
+    await interaction.update({ content: 'تم الإلغاء، لم يُحذف أي لوبي.', components: [], embeds: [] });
+    return true;
+  }
+  const confirmClose = interaction.isButton?.() && interaction.customId.match(/^nll:(admin-close|owner-close):([a-f0-9]+)$/i);
+  if (confirmClose) {
+    const lobby = lobbies.get(confirmClose[2]);
+    const allowed = confirmClose[1] === 'admin-close'
+      ? canAdminister(interaction.guild, interaction.user.id) : ownerOnly(interaction, lobby);
+    if (!allowed || (lobby && lobby.guildId !== interaction.guildId)) {
+      await interaction.reply({ content: 'ما عندك صلاحية إغلاق هذا اللوبي.', ephemeral: true });
+      return true;
+    }
+    if (!lobby) {
+      await interaction.update({ content: 'اللوبي محذوف بالفعل.', embeds: [], components: [] });
+      return true;
+    }
+    await interaction.deferUpdate();
+    await destroyLobby(interaction.guild, lobby);
+    await interaction.editReply({ content: 'تم إغلاق اللوبي وإزالته من Find Lobby.', embeds: [], components: [] });
+    return true;
+  }
+  const gameRefresh = interaction.isButton?.() && interaction.customId.match(/^nll:game-refresh(?::(genshin|minecraft))?$/);
+  if (gameRefresh) {
+    await interaction.update(gameMenuPayload(gameRefresh[1] || 'genshin'));
+    return true;
+  }
+  const createBtn = interaction.isButton?.() && interaction.customId.match(/^nll:create(?::(genshin|minecraft))?$/);
+  if (createBtn) {
+    const game = createBtn[1] || 'genshin';
+    await reconcileGuildLobbies(interaction.guild);
+    const existing = memberLobby(interaction.guildId, interaction.user.id, game);
+    if (existing) {
+      await interaction.reply({ content: 'أنت موجود بالفعل في <#' + existing.textChannelId + '>. اخرج منه أولاً.', ephemeral: true });
+      return true;
+    }
+    await interaction.showModal(profileModal('nll:create-modal:' + game, 'Create ' + gameLabel(game) + ' Lobby', game));
+    return true;
+  }
+  if (interaction.isModalSubmit?.() && /^nll:create-modal(?::(genshin|minecraft))?$/.test(interaction.customId)) {
     await handleCreateModal(interaction, client);
     return true;
   }
-  if (interaction.isButton?.() && interaction.customId === 'nll:find') {
-    await interaction.reply({ ...findPayload(interaction.guild), ephemeral: true });
-    rememberFinderView(interaction);
+  const findBtn = interaction.isButton?.() && interaction.customId.match(/^nll:find(?::(genshin|minecraft))?$/);
+  if (findBtn) {
+    const game = findBtn[1] || 'genshin';
+    await reconcileGuildLobbies(interaction.guild);
+    await interaction.reply({ ...findPayload(interaction.guild, game), ephemeral: true });
+    rememberFinderView(interaction, game);
     return true;
   }
-  if (interaction.isButton?.() && interaction.customId === 'nll:find-refresh') {
-    await interaction.update(findPayload(interaction.guild));
-    rememberFinderView(interaction);
+  const findRefresh = interaction.isButton?.() && interaction.customId.match(/^nll:find-refresh(?::(genshin|minecraft))?$/);
+  if (findRefresh) {
+    const game = findRefresh[1] || 'genshin';
+    await reconcileGuildLobbies(interaction.guild);
+    await interaction.update(findPayload(interaction.guild, game));
+    rememberFinderView(interaction, game);
     return true;
   }
-  if (interaction.isStringSelectMenu?.() && interaction.customId === 'nll:find-select') {
-    const lobbyId = interaction.values[0];
-    if (lobbyId === 'none') {
+  const findSelect = interaction.isStringSelectMenu?.() && interaction.customId.match(/^nll:find-select(?::(genshin|minecraft))?$/);
+  if (findSelect) {
+    const game = findSelect[1] || 'genshin';
+    await reconcileGuildLobbies(interaction.guild);
+    const id = interaction.values[0];
+    if (id === 'none') {
       await interaction.reply({ content: 'لا توجد لوبيات متاحة.', ephemeral: true });
       return true;
     }
-    const lobby = lobbies.get(lobbyId);
-    if (!lobby || lobby.locked || isFull(lobby)) {
-      await interaction.reply({ content: 'هذا اللوبي لم يعد متاحًا. اضغط Refresh.', ephemeral: true });
+    const lobby = lobbies.get(id);
+    if (!lobby || lobby.guildId !== interaction.guildId || normalizeGame(lobby.game) !== game || lobby.locked || isFull(lobby)) {
+      await interaction.reply({ content: 'هذا اللوبي لم يعد متاحاً. اضغط Refresh.', ephemeral: true });
       return true;
     }
-    await interaction.showModal(profileModal(`nll:join-modal:${lobby.id}`, 'Join Genshin Lobby'));
+    await interaction.showModal(profileModal('nll:join-modal:' + lobby.id, 'Join ' + gameLabel(game) + ' Lobby', game));
     return true;
   }
   if (interaction.isModalSubmit?.() && interaction.customId.startsWith('nll:join-modal:')) {
@@ -911,11 +1013,13 @@ async function handleInteraction(interaction, client) {
     return true;
   }
 
-  const ownerButton = interaction.isButton?.() && interaction.customId.match(/^nll:(unlock|lock|transfer|limit|approve|free|kick):([a-f0-9]+)$/i);
+
+
+  const ownerButton = interaction.isButton?.() && interaction.customId.match(/^nll:(unlock|lock|transfer|limit|approve|free|kick|close):([a-f0-9]+)$/i);
   if (ownerButton) {
     const [, action, lobbyId] = ownerButton;
     const lobby = lobbies.get(lobbyId);
-    if (!lobby) {
+    if (!lobby || lobby.guildId !== interaction.guildId) {
       await interaction.reply({ content: 'هذا اللوبي لم يعد موجودًا.', ephemeral: true });
       return true;
     }
@@ -926,7 +1030,7 @@ async function handleInteraction(interaction, client) {
   const leaveMatch = interaction.isButton?.() && interaction.customId.match(/^nll:leave:([a-f0-9]+)$/i);
   if (leaveMatch) {
     const lobby = lobbies.get(leaveMatch[1]);
-    if (!lobby || !lobby.members.some((row) => row.userId === interaction.user.id)) {
+    if (!lobby || lobby.guildId !== interaction.guildId || !lobby.members.some((row) => row.userId === interaction.user.id)) {
       await interaction.reply({ content: 'أنت لست عضوًا في هذا اللوبي.', ephemeral: true });
       return true;
     }
