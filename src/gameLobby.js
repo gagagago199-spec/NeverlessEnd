@@ -31,6 +31,7 @@ const lobbies = new Map();
 const stateMessageIds = new Map();
 const finderViews = new Map();
 const pendingInteractions = new Map();
+const reconcileInFlight = new Map();
 let installed = false;
 
 function normalizeUid(value) {
@@ -47,6 +48,30 @@ function normalizeServer(value) {
   return null;
 }
 
+function normalizeGame(value) { return value === 'minecraft' ? 'minecraft' : 'genshin'; }
+function gameLabel(value) { return normalizeGame(value) === 'minecraft' ? 'Minecraft' : 'Genshin Impact'; }
+function normalizeMinecraftEdition(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'java') return 'JAVA';
+  if (v === 'bedrock') return 'BEDROCK';
+  return null;
+}
+function normalizeMinecraftName(value, edition) {
+  const v = String(value || '').trim();
+  if (edition === 'JAVA') return /^[A-Za-z0-9_]{3,16}$/.test(v) ? v : null;
+  if (edition === 'BEDROCK') return /^[\p{L}\p{N}_ .-]{1,20}$/u.test(v) ? v : null;
+  return null;
+}
+function normalizeProfile(game, uid, server) {
+  if (normalizeGame(game) === 'minecraft') {
+    const edition = normalizeMinecraftEdition(server), name = normalizeMinecraftName(uid, edition);
+    return name && edition ? { uid: name, server: edition } : null;
+  }
+  const name = normalizeUid(uid), region = normalizeServer(server);
+  return name && region ? { uid: name, server: region } : null;
+}
+function canAdminister(guild, userId) { return Boolean(guild && String(guild.ownerId) === String(userId)); }
+
 function lobbyKey(guildId, lobbyId) {
   return `${guildId}:${lobbyId}`;
 }
@@ -55,7 +80,7 @@ function encodeLobby(lobby) {
   const data = {
     id: lobby.id,
     guildId: lobby.guildId,
-    game: 'genshin',
+    game: normalizeGame(lobby.game),
     ownerId: lobby.ownerId,
     members: lobby.members,
     locked: Boolean(lobby.locked),
@@ -114,7 +139,7 @@ function sanitizeLobby(raw, now = Date.now()) {
   return {
     id: String(raw.id),
     guildId: String(raw.guildId),
-    game: 'genshin',
+    game: normalizeGame(raw.game),
     ownerId: String(raw.ownerId),
     members,
     locked: Boolean(raw.locked),
@@ -130,12 +155,12 @@ function sanitizeLobby(raw, now = Date.now()) {
   };
 }
 
-function guildLobbies(guildId) {
-  return [...lobbies.values()].filter((lobby) => lobby.guildId === String(guildId));
+function guildLobbies(guildId, game = null) {
+  return [...lobbies.values()].filter((lobby) => lobby.guildId === String(guildId) && (!game || normalizeGame(lobby.game) === normalizeGame(game)));
 }
 
-function memberLobby(guildId, userId) {
-  return guildLobbies(guildId).find((lobby) => lobby.members.some((row) => row.userId === String(userId))) || null;
+function memberLobby(guildId, userId, game = null) {
+  return guildLobbies(guildId, game).find((lobby) => lobby.members.some((row) => row.userId === String(userId))) || null;
 }
 
 function nextOwnerId(lobby, leavingUserId) {
@@ -149,8 +174,8 @@ function isFull(lobby) {
   return (lobby?.members?.length || 0) >= Number(lobby?.limit || DEFAULT_LIMIT);
 }
 
-function findableLobbies(guildId) {
-  return guildLobbies(guildId)
+function findableLobbies(guildId, game = 'genshin') {
+  return guildLobbies(guildId, game)
     .filter((lobby) => !lobby.locked && !isFull(lobby))
     .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt));
 }
@@ -220,7 +245,8 @@ function panelComponents() {
   const select = new StringSelectMenuBuilder()
     .setCustomId('nll:game')
     .setPlaceholder('اختر اللعبة')
-    .addOptions({ label: 'Genshin Impact', value: 'genshin', emoji: '✨', description: 'Create or find a Genshin lobby' });
+    .addOptions({ label: 'Genshin Impact', value: 'genshin', emoji: '✨', description: 'Create or find a Genshin lobby' },
+      { label: 'Minecraft', value: 'minecraft', emoji: '⛏️', description: 'Java and Bedrock lobbies' });
   const refresh = new ButtonBuilder()
     .setCustomId('nll:panel-refresh')
     .setLabel('Refresh')
@@ -228,7 +254,8 @@ function panelComponents() {
     .setStyle(ButtonStyle.Secondary);
   return [
     new ActionRowBuilder().addComponents(select),
-    new ActionRowBuilder().addComponents(refresh),
+    new ActionRowBuilder().addComponents(refresh,
+      new ButtonBuilder().setCustomId('nll:admin').setLabel('Manage Lobbies').setStyle(ButtonStyle.Secondary)),
   ];
 }
 
@@ -251,47 +278,27 @@ async function ensurePanel(client) {
   return channel.send(payload);
 }
 
-function gameMenuPayload() {
-  const embed = new EmbedBuilder()
-    .setColor(0x6f8bd8)
-    .setTitle('✨ Genshin Impact')
-    .setDescription('اختر إنشاء لوبي جديد أو البحث عن لوبي موجود.');
-  return {
-    embeds: [embed],
+function gameMenuPayload(game = 'genshin') {
+  game = normalizeGame(game);
+  return { embeds: [new EmbedBuilder().setColor(0x6f8bd8).setTitle((game === 'minecraft' ? '⛏️ ' : '✨ ') + gameLabel(game))
+      .setDescription('اختر إنشاء لوبي جديد أو البحث عن لوبي موجود.')],
     components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('nll:create').setLabel('Create Lobby').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('nll:find').setLabel('Find Lobby').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('nll:game-refresh').setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
-    )],
-  };
+      new ButtonBuilder().setCustomId('nll:create:' + game).setLabel('Create Lobby').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('nll:find:' + game).setLabel('Find Lobby').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('nll:game-refresh:' + game).setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+    )] };
 }
-
-function profileModal(customId, title) {
-  return new ModalBuilder()
-    .setCustomId(customId)
-    .setTitle(title)
-    .addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('uid')
-          .setLabel('Genshin UID')
-          .setPlaceholder('مثال: 700123456')
-          .setStyle(TextInputStyle.Short)
-          .setMinLength(9)
-          .setMaxLength(10)
-          .setRequired(true),
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('server')
-          .setLabel('Server')
-          .setPlaceholder('EU / NA / ASIA / TW-HK-MO')
-          .setStyle(TextInputStyle.Short)
-          .setMinLength(2)
-          .setMaxLength(20)
-          .setRequired(true),
-      ),
-    );
+function profileModal(customId, title, game = 'genshin') {
+  const mc = normalizeGame(game) === 'minecraft';
+  return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('uid')
+      .setLabel(mc ? 'Minecraft Username / Gamertag' : 'Genshin UID')
+      .setPlaceholder(mc ? 'Java username or Bedrock gamertag' : '700123456')
+      .setStyle(TextInputStyle.Short).setMinLength(mc ? 1 : 9).setMaxLength(mc ? 20 : 10).setRequired(true)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('server')
+      .setLabel(mc ? 'Edition' : 'Server').setPlaceholder(mc ? 'Java / Bedrock' : 'EU / NA / ASIA / TW-HK-MO')
+      .setStyle(TextInputStyle.Short).setMinLength(2).setMaxLength(20).setRequired(true)),
+  );
 }
 
 function safeTextName(value, fallback) {
@@ -360,8 +367,8 @@ async function createLobbyChannels(guild, client, lobby, ownerName) {
   const parentId = lobby.parentId || panel?.parentId || null;
   lobby.parentId = parentId;
   const suffix = lobby.id.slice(0, 6);
-  const textName = `genshin-${safeTextName(ownerName, `lobby-${suffix}`)}`.slice(0, 95);
-  const voiceName = `Genshin • ${String(ownerName || `Lobby ${suffix}`).slice(0, 80)}`;
+  const textName = `${normalizeGame(lobby.game)}-${safeTextName(ownerName, `lobby-${suffix}`)}`.slice(0, 95);
+  const voiceName = `${gameLabel(lobby.game)} • ${String(ownerName || `Lobby ${suffix}`).slice(0, 80)}`;
 
   let textChannel;
   let voiceChannel;
@@ -372,7 +379,7 @@ async function createLobbyChannels(guild, client, lobby, ownerName) {
       parent: parentId || undefined,
       topic: `${LOBBY_TOPIC_PREFIX}${lobby.id}`,
       permissionOverwrites: textOverwrites(guild, client.user.id, lobby.members),
-      reason: 'Neverless Genshin lobby',
+      reason: 'Neverless game lobby',
     });
     voiceChannel = await guild.channels.create({
       name: voiceName,
@@ -380,7 +387,7 @@ async function createLobbyChannels(guild, client, lobby, ownerName) {
       parent: parentId || undefined,
       userLimit: lobby.limit,
       permissionOverwrites: voiceOverwrites(guild, client.user.id, lobby.members),
-      reason: 'Neverless Genshin lobby',
+      reason: 'Neverless game lobby',
     });
   } catch (error) {
     if (textChannel) await textChannel.delete().catch(() => {});
@@ -400,10 +407,10 @@ function lobbyEmbed(lobby) {
   const lines = lobby.members
     .slice()
     .sort((a, b) => Number(a.joinedAt) - Number(b.joinedAt))
-    .map((row) => `${row.userId === lobby.ownerId ? '👑' : '•'} <@${row.userId}> — UID **${row.uid}** • **${row.server}**`);
+    .map((row) => `${row.userId === lobby.ownerId ? '👑' : '•'} <@${row.userId}> — ${normalizeGame(lobby.game) === 'minecraft' ? 'Player' : 'UID'} **${row.uid}** • **${row.server}**`);
   return new EmbedBuilder()
     .setColor(lobby.locked ? 0x8e7a8e : 0x57c785)
-    .setTitle('✨ Genshin Lobby')
+    .setTitle((normalizeGame(lobby.game) === 'minecraft' ? '⛏️ Minecraft' : '✨ Genshin') + ' Lobby')
     .setDescription(lines.join('\n') || 'لا يوجد أعضاء.')
     .addFields(
       { name: 'Owner', value: `<@${lobby.ownerId}>`, inline: true },
@@ -429,6 +436,7 @@ function lobbyControls(lobby) {
       new ButtonBuilder().setCustomId(`nll:free:${lobby.id}`).setLabel('Free to Join').setStyle(ButtonStyle.Success).setDisabled(lobby.joinMode === 'free'),
       new ButtonBuilder().setCustomId(`nll:kick:${lobby.id}`).setLabel('Kick').setStyle(ButtonStyle.Danger).setDisabled(!hasTransfer),
       new ButtonBuilder().setCustomId(`nll:leave:${lobby.id}`).setLabel('Leave').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`nll:close:${lobby.id}`).setLabel('Close Lobby').setStyle(ButtonStyle.Danger),
     ),
   ];
 }
@@ -447,10 +455,10 @@ async function refreshControl(guild, lobby) {
   return message;
 }
 
-function findSelect(guild) {
-  const open = findableLobbies(guild.id).slice(0, 25);
+function findSelect(guild, game = 'genshin') {
+  const open = findableLobbies(guild.id, game).slice(0, 25);
   const menu = new StringSelectMenuBuilder()
-    .setCustomId('nll:find-select')
+    .setCustomId('nll:find-select:' + normalizeGame(game))
     .setPlaceholder(open.length ? 'اختر اللوبي' : 'لا توجد لوبيات متاحة')
     .setDisabled(!open.length);
   if (!open.length) menu.addOptions({ label: 'لا توجد لوبيات متاحة', value: 'none' });
@@ -469,17 +477,17 @@ function findSelect(guild) {
   return menu;
 }
 
-function findPayload(guild) {
-  const openCount = findableLobbies(guild.id).length;
+function findPayload(guild, game = 'genshin') {
+  const openCount = findableLobbies(guild.id, game).length;
   return {
     embeds: [new EmbedBuilder()
       .setColor(0x6f8bd8)
-      .setTitle('Find Genshin Lobby')
+      .setTitle('Find ' + gameLabel(game) + ' Lobby')
       .setDescription(openCount ? `اللوبيات المتاحة الآن: **${openCount}**` : 'لا توجد لوبيات مفتوحة حاليًا.')],
     components: [
-      new ActionRowBuilder().addComponents(findSelect(guild)),
+      new ActionRowBuilder().addComponents(findSelect(guild, game)),
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('nll:find-refresh').setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('nll:find-refresh:' + normalizeGame(game)).setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
       ),
     ],
   };
@@ -489,8 +497,8 @@ function finderViewKey(interaction) {
   return `${interaction.guildId}:${interaction.user.id}`;
 }
 
-function rememberFinderView(interaction) {
-  finderViews.set(finderViewKey(interaction), { interaction, createdAt: Date.now() });
+function rememberFinderView(interaction, game = 'genshin') {
+  finderViews.set(finderViewKey(interaction), { interaction, game: normalizeGame(game), createdAt: Date.now() });
 }
 
 async function refreshFinderViews(guild) {
@@ -501,7 +509,7 @@ async function refreshFinderViews(guild) {
       finderViews.delete(key);
       continue;
     }
-    await row.interaction.editReply(findPayload(guild)).catch(() => finderViews.delete(key));
+    await row.interaction.editReply(findPayload(guild, row.game)).catch(() => finderViews.delete(key));
   }
 }
 
@@ -588,7 +596,7 @@ async function leaveLobby(guild, lobby, userId) {
 }
 
 function ownerOnly(interaction, lobby) {
-  return lobby && interaction.user.id === lobby.ownerId;
+  return lobby && lobby.guildId === interaction.guildId && interaction.user.id === lobby.ownerId;
 }
 
 function memberOptions(guild, lobby, excludeOwner = true) {
@@ -598,18 +606,18 @@ function memberOptions(guild, lobby, excludeOwner = true) {
     .map((row) => {
       const member = guild.members.cache.get(row.userId);
       const name = member?.displayName || member?.user?.username || row.userId;
-      return { label: String(name).slice(0, 100), value: row.userId, description: `${row.server} • UID ${row.uid}`.slice(0, 100) };
+      return { label: String(name).slice(0, 100), value: row.userId, description: `${row.server} • ${normalizeGame(lobby.game) === 'minecraft' ? 'Player' : 'UID'} ${row.uid}`.slice(0, 100) };
     });
 }
 
-function requestEmbed(request) {
+function requestEmbed(request, lobby) {
   return new EmbedBuilder()
     .setColor(0xe2b85c)
     .setTitle('طلب انضمام إلى اللوبي')
     .setDescription(`<@${request.userId}> طلب الانضمام.`)
     .addFields(
-      { name: 'UID', value: request.uid, inline: true },
-      { name: 'Server', value: request.server, inline: true },
+      { name: normalizeGame(lobby?.game) === 'minecraft' ? 'Player' : 'UID', value: request.uid, inline: true },
+      { name: normalizeGame(lobby?.game) === 'minecraft' ? 'Edition' : 'Server', value: request.server, inline: true },
     );
 }
 
@@ -624,7 +632,7 @@ async function ensureRequestMessage(guild, lobby, request) {
   const channel = guild.channels.cache.get(lobby.textChannelId) || await guild.channels.fetch(lobby.textChannelId).catch(() => null);
   if (!channel?.isTextBased?.()) return;
   let message = request.messageId ? await channel.messages.fetch(request.messageId).catch(() => null) : null;
-  const payload = { embeds: [requestEmbed(request)], components: requestComponents(lobby.id, request.id), allowedMentions: { users: [request.userId] } };
+  const payload = { embeds: [requestEmbed(request, lobby)], components: requestComponents(lobby.id, request.id), allowedMentions: { users: [request.userId] } };
   if (message) await message.edit(payload).catch(() => {});
   else {
     message = await channel.send(payload);
@@ -650,25 +658,26 @@ async function notifyRequester(client, request, accepted, lobby) {
 }
 
 async function handleCreateModal(interaction, client) {
-  const existing = memberLobby(interaction.guildId, interaction.user.id);
+  const game = interaction.customId.endsWith(':minecraft') ? 'minecraft' : 'genshin';
+  const existing = memberLobby(interaction.guildId, interaction.user.id, game);
   if (existing) {
     await interaction.reply({ content: `أنت موجود بالفعل في <#${existing.textChannelId}>. اخرج منه قبل إنشاء لوبي جديد.`, ephemeral: true });
     return;
   }
-  const uid = normalizeUid(interaction.fields.getTextInputValue('uid'));
-  const server = normalizeServer(interaction.fields.getTextInputValue('server'));
-  if (!uid || !server) {
-    await interaction.reply({ content: 'تأكد من UID والسيرفر. السيرفرات المدعومة: EU / NA / ASIA / TW-HK-MO.', ephemeral: true });
+  const profile = normalizeProfile(game, interaction.fields.getTextInputValue('uid'), interaction.fields.getTextInputValue('server'));
+  if (!profile) {
+    await interaction.reply({ content: game === 'minecraft' ? 'تأكد من اسم Minecraft والنسخة Java أو Bedrock.' : 'تأكد من UID والسيرفر. السيرفرات المدعومة: EU / NA / ASIA / TW-HK-MO.', ephemeral: true });
     return;
   }
   await interaction.deferReply({ ephemeral: true });
   const guild = interaction.guild;
   const member = interaction.member;
   const lobby = {
+    game,
     id: crypto.randomBytes(6).toString('hex'),
     guildId: guild.id,
     ownerId: interaction.user.id,
-    members: [{ userId: interaction.user.id, uid, server, joinedAt: Date.now() }],
+    members: [{ userId: interaction.user.id, ...profile, joinedAt: Date.now() }],
     locked: false,
     joinMode: 'free',
     limit: DEFAULT_LIMIT,
@@ -702,7 +711,7 @@ async function handleJoinModal(interaction, client, lobbyId) {
     await interaction.reply({ content: 'هذا اللوبي لم يعد متاحًا للدخول.', ephemeral: true });
     return;
   }
-  const existing = memberLobby(interaction.guildId, interaction.user.id);
+  const existing = memberLobby(interaction.guildId, interaction.user.id, lobby.game);
   if (existing) {
     await interaction.reply({ content: existing.id === lobby.id ? `أنت داخل هذا اللوبي بالفعل: <#${existing.textChannelId}>` : `أنت موجود حاليًا في <#${existing.textChannelId}>. اخرج منه أولًا.`, ephemeral: true });
     return;
@@ -711,16 +720,15 @@ async function handleJoinModal(interaction, client, lobbyId) {
     await interaction.reply({ content: 'اللوبي ممتلئ حاليًا.', ephemeral: true });
     return;
   }
-  const uid = normalizeUid(interaction.fields.getTextInputValue('uid'));
-  const server = normalizeServer(interaction.fields.getTextInputValue('server'));
-  if (!uid || !server) {
-    await interaction.reply({ content: 'تأكد من UID والسيرفر. السيرفرات المدعومة: EU / NA / ASIA / TW-HK-MO.', ephemeral: true });
+  const profile = normalizeProfile(lobby.game, interaction.fields.getTextInputValue('uid'), interaction.fields.getTextInputValue('server'));
+  if (!profile) {
+    await interaction.reply({ content: normalizeGame(lobby.game) === 'minecraft' ? 'تأكد من اسم Minecraft والنسخة Java أو Bedrock.' : 'تأكد من UID والسيرفر. السيرفرات المدعومة: EU / NA / ASIA / TW-HK-MO.', ephemeral: true });
     return;
   }
 
   if (lobby.joinMode === 'free') {
     await interaction.deferReply({ ephemeral: true });
-    const joined = await addMemberToLobby(guild, lobby, interaction.user.id, uid, server);
+    const joined = await addMemberToLobby(guild, lobby, interaction.user.id, profile.uid, profile.server);
     if (!joined) await interaction.editReply('اللوبي امتلأ قبل إتمام دخولك.');
     else await interaction.editReply(`دخلت اللوبي مباشرة.\n💬 <#${lobby.textChannelId}>\n🔊 <#${lobby.voiceChannelId}>`);
     return;
@@ -738,8 +746,8 @@ async function handleJoinModal(interaction, client, lobbyId) {
   const request = {
     id: crypto.randomBytes(5).toString('hex'),
     userId: interaction.user.id,
-    uid,
-    server,
+    uid: profile.uid,
+    server: profile.server,
     createdAt: Date.now(),
     messageId: null,
   };
@@ -763,6 +771,10 @@ async function handleOwnerButton(interaction, action, lobby) {
     if (action === 'free') lobby.joinMode = 'free';
     await interaction.deferUpdate();
     await updateLobby(guild, lobby);
+    return;
+  }
+  if (action === 'close') {
+    await interaction.reply({ ...closeConfirmation(lobby), ephemeral: true });
     return;
   }
   if (action === 'transfer') {
@@ -821,7 +833,7 @@ async function handleRequestDecision(interaction, client, accepted, lobbyId, req
     return;
   }
   if (accepted) {
-    const existing = memberLobby(interaction.guildId, request.userId);
+    const existing = memberLobby(interaction.guildId, request.userId, lobby.game);
     if (existing && existing.id !== lobby.id) {
       await interaction.reply({ content: 'العضو دخل لوبي آخر بالفعل.', ephemeral: true });
       return;
@@ -834,7 +846,7 @@ async function handleRequestDecision(interaction, client, accepted, lobbyId, req
   }
   lobby.pending = lobby.pending.filter((row) => row.id !== requestId);
   await updateLobby(interaction.guild, lobby);
-  const resultEmbed = requestEmbed(request)
+  const resultEmbed = requestEmbed(request, lobby)
     .setColor(accepted ? 0x57c785 : 0xd95c5c)
     .setFooter({ text: accepted ? 'Accepted' : 'Rejected' });
   await interaction.update({ embeds: [resultEmbed], components: [], allowedMentions: { parse: [] } }).catch(() => {});
@@ -958,7 +970,7 @@ async function handleInteraction(interaction, client) {
     await removeMemberPermissions(interaction.guild, lobby, target);
     await updateLobby(interaction.guild, lobby);
     const user = await client.users.fetch(target).catch(() => null);
-    await user?.send(`تم إخراجك من Genshin Lobby بواسطة <@${lobby.ownerId}>.`).catch(() => {});
+    await user?.send(`تم إخراجك من ${gameLabel(lobby.game)} Lobby بواسطة <@${lobby.ownerId}>.`).catch(() => {});
     await interaction.update({ content: `تم إخراج <@${target}> من اللوبي.`, components: [], allowedMentions: { users: [target] } });
     return true;
   }
@@ -1086,6 +1098,11 @@ module.exports = {
   handleInteraction,
   normalizeUid,
   normalizeServer,
+  normalizeGame,
+  normalizeMinecraftEdition,
+  normalizeMinecraftName,
+  normalizeProfile,
+  canAdminister,
   stateContent,
   parseState,
   sanitizeLobby,
