@@ -9,6 +9,8 @@ const {
   normalizeMinecraftName,
   normalizeProfile,
   canAdminister,
+  canCloseLobby,
+  adminPayload,
   stateContent,
   parseState,
   sanitizeLobby,
@@ -94,5 +96,25 @@ const tombstone = { guildId: lobby.guildId, id: lobby.id, deleted: true };
 const tombstoneContent = 'NLGLOBBY1|' + lobby.guildId + '|' + lobby.id + '|' +
   require('node:zlib').deflateRawSync(Buffer.from(JSON.stringify(tombstone))).toString('base64url');
 assert.equal(parseState(tombstoneContent).deleted, true);
+
+// Discord requires unique component IDs even on disabled buttons. In one-page
+// guilds both previous/next target page zero but must retain different IDs.
+const singlePage = adminPayload({ id: lobby.guildId });
+const controlIds = singlePage.components
+  .flatMap((row) => row.toJSON().components)
+  .map((component) => component.custom_id);
+assert.equal(new Set(controlIds).size, controlIds.length, 'Manage Lobbies must have unique custom IDs');
+assert.ok(controlIds.some((id) => id.endsWith(':prev')));
+assert.ok(controlIds.some((id) => id.endsWith(':next')));
+
+// Server owner and current lobby owner may close; ordinary members and
+// other guilds must not. Only closing has elevated server-owner privileges.
+const interactionFor = (id, guildId = lobby.guildId) => ({
+  guildId, user: { id }, guild: { ownerId: '1542716819327156299' },
+});
+assert.equal(canCloseLobby(interactionFor(lobby.ownerId), lobby), true);
+assert.equal(canCloseLobby(interactionFor('1542716819327156299'), lobby), true);
+assert.equal(canCloseLobby(interactionFor('1542716819327156298'), lobby), false);
+assert.equal(canCloseLobby(interactionFor('1542716819327156299', '1542716819327156311'), lobby), false);
 
 console.log('game lobby tests passed');
