@@ -524,8 +524,8 @@ function adminPayload(guild, page = 0) {
       .setTitle('Manage Lobbies • Server Owner')
       .setDescription('لوبيات السيرفر المسجلة: **' + list.length + '**. اختر اللوبي الذي تريد إغلاقه.')],
     components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.max(0, p - 1)).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(p === 0),
-      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.min(lastPage, p + 1)).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(p === lastPage),
+      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.max(0, p - 1) + ':prev').setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(p === 0),
+      new ButtonBuilder().setCustomId('nll:admin-page:' + Math.min(lastPage, p + 1) + ':next').setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(p === lastPage),
       new ButtonBuilder().setCustomId('nll:admin-refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
     )] };
 }
@@ -644,7 +644,14 @@ async function leaveLobby(guild, lobby, userId) {
 }
 
 function ownerOnly(interaction, lobby) {
-  return lobby && lobby.guildId === interaction.guildId && interaction.user.id === lobby.ownerId;
+  return Boolean(lobby && lobby.guildId === interaction.guildId && interaction.user.id === lobby.ownerId);
+}
+
+// Only closing a lobby is shared between the server owner and the current lobby owner.
+// Lock, kick, transfer and admission settings remain restricted to the lobby owner.
+function canCloseLobby(interaction, lobby) {
+  return Boolean(lobby && lobby.guildId === interaction.guildId &&
+    (ownerOnly(interaction, lobby) || canAdminister(interaction.guild, interaction.user.id)));
 }
 
 function memberOptions(guild, lobby, excludeOwner = true) {
@@ -807,8 +814,8 @@ async function handleJoinModal(interaction, client, lobbyId) {
 }
 
 async function handleOwnerButton(interaction, action, lobby) {
-  if (!ownerOnly(interaction, lobby)) {
-    await interaction.reply({ content: 'هذا الزر لمالك اللوبي فقط.', ephemeral: true });
+  if (!(action === 'close' ? canCloseLobby(interaction, lobby) : ownerOnly(interaction, lobby))) {
+    await interaction.reply({ content: action === 'close' ? 'إغلاق اللوبي مسموح لمالك السيرفر أو مالك اللوبي فقط.' : 'هذا الزر لمالك اللوبي فقط.', ephemeral: true });
     return;
   }
   const guild = interaction.guild;
@@ -822,7 +829,7 @@ async function handleOwnerButton(interaction, action, lobby) {
     return;
   }
   if (action === 'close') {
-    await interaction.reply({ ...closeConfirmation(lobby), ephemeral: true });
+    await interaction.reply({ ...closeConfirmation(lobby, canAdminister(interaction.guild, interaction.user.id)), ephemeral: true });
     return;
   }
   if (action === 'transfer') {
@@ -919,20 +926,17 @@ async function handleInteraction(interaction, client) {
       await interaction.reply({ content: 'إدارة جميع اللوبيات لمالك السيرفر فقط.', ephemeral: true });
       return true;
     }
-    await interaction.deferReply({ ephemeral: true });
-    await reconcileGuildLobbies(interaction.guild);
-    await interaction.editReply(adminPayload(interaction.guild));
+    // Render immediately; slow Discord member lookups must not leave this button on Thinking.
+    await interaction.reply({ ...adminPayload(interaction.guild), ephemeral: true });
     return true;
   }
-  const adminNav = interaction.isButton?.() && interaction.customId.match(/^nll:admin-page:(\d+)$/);
+  const adminNav = interaction.isButton?.() && interaction.customId.match(/^nll:admin-page:(\d+):(prev|next)$/);
   if (interaction.isButton?.() && (interaction.customId === 'nll:admin-refresh' || adminNav)) {
     if (!canAdminister(interaction.guild, interaction.user.id)) {
       await interaction.reply({ content: 'إدارة اللوبيات لمالك السيرفر فقط.', ephemeral: true });
       return true;
     }
-    await interaction.deferUpdate();
-    await reconcileGuildLobbies(interaction.guild);
-    await interaction.editReply(adminPayload(interaction.guild, adminNav ? Number(adminNav[1]) : 0));
+    await interaction.update(adminPayload(interaction.guild, adminNav ? Number(adminNav[1]) : 0));
     return true;
   }
   if (interaction.isStringSelectMenu?.() && interaction.customId === 'nll:admin-select') {
@@ -955,8 +959,8 @@ async function handleInteraction(interaction, client) {
   const confirmClose = interaction.isButton?.() && interaction.customId.match(/^nll:(admin-close|owner-close):([a-f0-9]+)$/i);
   if (confirmClose) {
     const lobby = lobbies.get(confirmClose[2]);
-    const allowed = confirmClose[1] === 'admin-close'
-      ? canAdminister(interaction.guild, interaction.user.id) : ownerOnly(interaction, lobby);
+    // Re-check permission on confirmation, independent of which button opened the dialog.
+    const allowed = canCloseLobby(interaction, lobby);
     if (!allowed || (lobby && lobby.guildId !== interaction.guildId)) {
       await interaction.reply({ content: 'ما عندك صلاحية إغلاق هذا اللوبي.', ephemeral: true });
       return true;
@@ -1289,6 +1293,8 @@ module.exports = {
   normalizeMinecraftName,
   normalizeProfile,
   canAdminister,
+  canCloseLobby,
+  adminPayload,
   stateContent,
   parseState,
   sanitizeLobby,
