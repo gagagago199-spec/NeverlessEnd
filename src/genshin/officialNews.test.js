@@ -75,6 +75,14 @@ async function main() {
   await news.pollOfficialNews(client, fakeFetch);
   assert.equal(channel.sent.length, 1, 'No duplicate when revisiting same article');
   assert.equal(requests, 16, 'Four official categories checked on each fetch');
+  const partlyUnavailable = await news.fetchOfficialNews(async (url) => {
+    const category = new URL(url).searchParams.get('iChanId');
+    return { ok: true, async json() {
+      return category === '396' ? { code: -1, data: null } : { code: 0, data: { list: [a, b, c] } };
+    } };
+  });
+  assert.equal(partlyUnavailable.length, 3, 'One broken category must not stop remaining official news');
+
   console.log('Genshin official news tests passed');
 }
 
