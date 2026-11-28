@@ -1,6 +1,7 @@
 'use strict';
 
 const zlib = require('node:zlib');
+const cheerio = require('cheerio');
 
 const OFFICIAL_API = 'https://api-os-takumi-static.hoyoverse.com/content_v2_user/app/a1b1f9d3315447cc/getContentList';
 const OFFICIAL_ARTICLE = /^https:\/\/genshin\.hoyoverse\.com\/(?:en|en-us)\/news\/detail\/(\d+)(?:[/?#].*)?$/i;
@@ -112,9 +113,113 @@ async function fetchOfficialNews(fetcher = fetch) {
     }
   }));
   if (!results.some((row) => row.ok)) {
-    throw new Error('All official news categories failed; no state was changed');
+    console.warn('[genshin-news] Official API unavailable; trying public feeds of official announcements.');
+    return fetchFallbackNews(fetcher);
   }
   return normalizeNewsRows(results.flatMap((row) => row.posts));
+}
+
+const FALLBACK_RSS = 'https://genshin-feed.com/feed/rss-en-all-articles.xml';
+const FALLBACK_JSON = 'https://feeds.c3kay.de/genshin.json';
+
+function extractSafeImages(html, explicit = []) {
+  const urls = [...explicit];
+  for (const match of String(html || '').matchAll(/<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi)) {
+    urls.push(match[1].replace(/&amp;/g, '&'));
+  }
+  return [...new Set(urls.filter(isOfficialImageUrl))].slice(0, 4);
+}
+
+function normalizeRssFeed(xml) {
+  if (typeof xml !== 'string' || xml.length > 12_000_000) throw new Error('RSS response too large or invalid');
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const rows = $('item').toArray().slice(0, 100).map((element) => {
+    const item = $(element);
+    const link = item.find('link').first().text().trim();
+    const match = link.match(OFFICIAL_ARTICLE);
+    if (!match) return null;
+    const title = cleanText(item.find('title').first().text(), 250);
+    if (!title) return null;
+    const summary = item.find('description').first().text() || '';
+    const content = item.find('content\\:encoded').first().text() || summary;
+    const pubDate = item.find('pubDate').first().text();
+    const parsedDate = Date.parse(pubDate);
+    return {
+      id: match[1],
+      title,
+      description: cleanText(summary, 1100),
+      published: Number.isFinite(parsedDate) ? new Date(parsedDate).toISOString() : '',
+      link: 'https://genshin.hoyoverse.com/en/news/detail/' + match[1],
+      images: extractSafeImages(content),
+    };
+  }).filter(Boolean);
+  return normalizeExistingPosts(rows);
+}
+
+function normalizeHoyolabFeed(feed) {
+  if (!Array.isArray(feed?.items)) throw new Error('Invalid HoYoLAB JSON feed');
+  const items = feed.items.slice(0, 90).map((item) => {
+    const url = String(item?.url || item?.external_url || '');
+    const match = url.match(/^https:\/\/(?:www\.)?hoyolab\.com\/article\/(\d{1,20})(?:[/?#]|$)/i);
+    if (!match) return null;
+    const title = cleanText(item.title, 250);
+    if (!title) return null;
+    return {
+      id: 'h' + match[1],
+      title,
+      description: cleanText(item.summary || item.content_text || item.content_html, 1100),
+      published: String(item.date_published || item.date_modified || ''),
+      link: 'https://www.hoyolab.com/article/' + match[1],
+      images: extractSafeImages(item.content_html, [item.image, item.banner_image].filter(Boolean)),
+    };
+  }).filter(Boolean);
+  return normalizeExistingPosts(items);
+}
+
+function normalizeExistingPosts(posts) {
+  const unique = new Map();
+  for (const post of posts) if (post?.id) unique.set(post.id, post);
+  return [...unique.values()].sort((a, b) =>
+    String(a.published).localeCompare(String(b.published)) || a.id.localeCompare(b.id));
+}
+
+function recentlyUpdated(posts, days = 90) {
+  return posts.some((post) => {
+    const timestamp = Date.parse(post.published);
+    return Number.isFinite(timestamp) && timestamp > Date.now() - days * 86400_000
+      && timestamp < Date.now() + 86400_000;
+  });
+}
+
+async function fetchFallbackNews(fetcher = fetch) {
+  const providers = [
+    {
+      label: 'Genshin Feed (official site article links)',
+      url: FALLBACK_RSS,
+      read: async (response) => normalizeRssFeed(await response.text()),
+    },
+    {
+      label: 'HoYoLAB official news feed',
+      url: FALLBACK_JSON,
+      read: async (response) => normalizeHoyolabFeed(await response.json()),
+    },
+  ];
+  for (const provider of providers) {
+    try {
+      const response = await fetcher(provider.url, {
+        signal: AbortSignal.timeout(12_000),
+        headers: { Accept: '*/*', 'User-Agent': 'NeverLess-GenshinNews/1.0' },
+      });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const posts = await provider.read(response);
+      if (!posts.length || !recentlyUpdated(posts)) throw new Error('No recent official announcements found');
+      console.log('[genshin-news] Using ' + provider.label + ', ' + posts.length + ' official news items.');
+      return posts;
+    } catch (error) {
+      console.warn('[genshin-news] Backup source failed: ' + provider.label + ': ' + error.message);
+    }
+  }
+  throw new Error('All official news sources unavailable; no news posted');
 }
 
 function isNewsChannel(channel) {
@@ -142,6 +247,7 @@ function encodeState(guildId, state) {
   const data = {
     channelId: state.channelId,
     seen: [...new Set(state.seen || [])].slice(-MAX_SEEN),
+    startedAt: Number(state.startedAt) || Date.now(),
     updatedAt: Date.now(),
   };
   return STATE_PREFIX + guildId + '|' +
@@ -157,7 +263,8 @@ function decodeState(content, guildId) {
     if (!Array.isArray(data.seen) || !/^\d{15,22}$/.test(String(data.channelId ?? ''))) return null;
     return {
       channelId: String(data.channelId),
-      seen: data.seen.filter((id) => /^\d{1,20}$/.test(String(id))).map(String).slice(-MAX_SEEN),
+      seen: data.seen.filter((id) => /^(?:h)?\d{1,20}$/.test(String(id))).map(String).slice(-MAX_SEEN),
+      startedAt: Number(data.startedAt) || null,
     };
   } catch { return null; }
 }
@@ -208,6 +315,7 @@ async function getGuildState(channel, client, posts) {
     : [...new Set([...posts.map((post) => post.id), ...history])];
   const state = {
     channelId: channel.id, seen: seen.slice(-MAX_SEEN),
+    startedAt: continued && Number(persisted.state.startedAt) ? Number(persisted.state.startedAt) : Date.now(),
     storage: persisted.storage, message: persisted.message,
   };
   guildStates.set(guild.id, state);
@@ -262,7 +370,20 @@ async function publishNews(channel, client, posts) {
   try {
     const state = await getGuildState(channel, client, posts);
     const seen = new Set(state.seen);
-    const newPosts = posts.filter((post) => !seen.has(post.id)).slice(0, MAX_NEW_PER_POLL);
+    // When upstream providers change, do not repost their older archives.
+    const newPosts = posts.filter((post) => {
+      if (seen.has(post.id)) return false;
+      const timestamp = Date.parse(post.published);
+      if (Number.isFinite(timestamp) && timestamp < state.startedAt - 10 * 60_000) {
+        seen.add(post.id);
+        return false;
+      }
+      return true;
+    }).slice(0, MAX_NEW_PER_POLL);
+    if (seen.size !== state.seen.length) {
+      state.seen = [...seen].slice(-MAX_SEEN);
+      await saveGuildState(channel, state);
+    }
     for (const post of newPosts) {
       await channel.send(buildNewsPayload(post));
       seen.add(post.id);
@@ -311,5 +432,6 @@ function installOfficialGenshinNews(client) {
 module.exports = {
   installOfficialGenshinNews, pollOfficialNews, fetchOfficialNews,
   normalizeChannelName, normalizePost, normalizeNewsRows, extractImages,
+  normalizeRssFeed, normalizeHoyolabFeed, recentlyUpdated,
   encodeState, decodeState, isNewsChannel, buildNewsPayload,
 };
