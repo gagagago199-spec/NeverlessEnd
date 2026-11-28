@@ -48,9 +48,35 @@ async function main() {
   assert.deepEqual(news.buildNewsPayload(normalized).allowedMentions, { parse: [] });
 
   const state = { channelId: channel.id, seen: ['188001', '188002'] };
-  assert.deepEqual(news.decodeState(news.encodeState(guild.id, state), guild.id), state);
+  const restoredState = news.decodeState(news.encodeState(guild.id, state), guild.id);
+  assert.equal(restoredState.channelId, state.channelId);
+  assert.deepEqual(restoredState.seen, state.seen);
+  assert.ok(restoredState.startedAt > 0, 'Persist initial baseline time');
   assert.equal(news.decodeState(news.encodeState(guild.id, state), '1550000000000000000'), null);
   assert.equal(news.decodeState('invalid', guild.id), null);
+  const rss = news.normalizeRssFeed(
+    '<rss xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><item>' +
+    '<title>Official RSS Article</title><link>https://genshin.hoyoverse.com/en/news/detail/188006</link>' +
+    '<description>Official update</description><pubDate>' + new Date().toUTCString() + '</pubDate>' +
+    '<content:encoded><![CDATA[<img src="https://fastcdn.hoyoverse.com/event.jpg">]]></content:encoded>' +
+    '</item></channel></rss>'
+  );
+  assert.equal(rss.length, 1);
+  assert.equal(rss[0].id, '188006');
+  assert.equal(rss[0].images[0], 'https://fastcdn.hoyoverse.com/event.jpg');
+  assert.ok(news.recentlyUpdated(rss));
+
+  const hoyolab = news.normalizeHoyolabFeed({ items: [{
+    id: 'test',
+    url: 'https://www.hoyolab.com/article/188007',
+    title: 'Official HoYoLAB Article',
+    date_published: new Date().toISOString(),
+    content_html: '<img src="https://upload-os-bbs.hoyolab.com/news.png">',
+  }] });
+  assert.equal(hoyolab.length, 1);
+  assert.equal(hoyolab[0].id, 'h188007');
+  assert.equal(hoyolab[0].images.length, 1);
+
 
   const client = { user: { id: '1550000000000000001' }, guilds: { cache: new Map([[guild.id, guild]]) } };
   let articles = [a, b];
