@@ -273,7 +273,8 @@ async function loadPersistedState(guild, client) {
   const storage = guild.channels.cache.find((ch) => ch.type === 0 && ch.name === STATE_CHANNEL_NAME);
   if (!storage) return { state: null, message: null, storage: null };
   let before;
-  for (let batchNo = 0; batchNo < 20; batchNo += 1) {
+  // Read only recent state; scanning years of neverless-data history can block Discord API for minutes.
+  for (let batchNo = 0; batchNo < 2; batchNo += 1) {
     const batch = await storage.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
     for (const message of batch.values()) {
       if (message.author?.id !== client.user?.id) continue;
@@ -304,6 +305,7 @@ async function getGuildState(channel, client, posts) {
   const guild = channel.guild;
   const cached = guildStates.get(guild.id);
   if (cached?.channelId === channel.id) return cached;
+  console.log('[genshin-news] Initializing news state for channel ' + channel.id + '.');
   const persisted = await loadPersistedState(guild, client).catch((error) => {
     console.warn('[genshin-news] Could not read persistent state:', error.message);
     return { state: null, storage: null, message: null };
