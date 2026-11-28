@@ -89,22 +89,32 @@ function normalizeNewsRows(rows) {
 }
 
 async function fetchOfficialNews(fetcher = fetch) {
+  // Some HoYoverse categories respond with an empty/changed payload even
+  // while other official categories are healthy. Preserve the healthy ones.
   const results = await Promise.all(CATEGORY_IDS.map(async (category) => {
-    const params = new URLSearchParams({
-      AppId: '32', iPageSize: '35', iPage: '1', iChanId: String(category), sLangKey: 'en-us',
-    });
-    const response = await fetcher(OFFICIAL_API + '?' + params.toString(), {
-      signal: AbortSignal.timeout(12_000),
-      headers: { Accept: 'application/json', 'User-Agent': 'NeverLess-GenshinNews/1.0' },
-    });
-    if (!response.ok) throw new Error('Official API HTTP ' + response.status + ' (category ' + category + ')');
-    const json = await response.json();
-    if (!Array.isArray(json?.data?.list)) {
-      throw new Error('Official API returned an unexpected response for category ' + category);
+    try {
+      const params = new URLSearchParams({
+        AppId: '32', iPageSize: '35', iPage: '1', iChanId: String(category), sLangKey: 'en-us',
+      });
+      const response = await fetcher(OFFICIAL_API + '?' + params.toString(), {
+        signal: AbortSignal.timeout(12_000),
+        headers: { Accept: 'application/json', 'User-Agent': 'NeverLess-GenshinNews/1.0' },
+      });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const json = await response.json();
+      if (!Array.isArray(json?.data?.list)) {
+        throw new Error('Unexpected response (code ' + String(json?.code ?? 'unknown').slice(0, 16) + ')');
+      }
+      return { ok: true, posts: json.data.list };
+    } catch (error) {
+      console.warn('[genshin-news] Category ' + category + ' unavailable: ' + error.message);
+      return { ok: false, posts: [] };
     }
-    return json.data.list;
   }));
-  return normalizeNewsRows(results.flat());
+  if (!results.some((row) => row.ok)) {
+    throw new Error('All official news categories failed; no state was changed');
+  }
+  return normalizeNewsRows(results.flatMap((row) => row.posts));
 }
 
 function isNewsChannel(channel) {
