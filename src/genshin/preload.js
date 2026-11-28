@@ -38,6 +38,7 @@ const { installGeneralChatGreetings } = require('../generalChatGreetings');
 const { installNeverlessAI } = require('../neverlessAI');
 const { installFriendshipSystem } = require('../friendshipSystem');
 const { installMlbb } = require('../mlbb/commands');
+const { installOfficialGenshinNews } = require('./officialNews');
 
 const CHANNEL_ID = process.env.GENSHIN_CHANNEL_ID || '1538091335079297034';
 const TEST_CHANNEL_ID = process.env.GENSHIN_TEST_CHANNEL_ID || '1539226931319545936';
@@ -134,6 +135,7 @@ Client.prototype.login = function neverlessGenshinLogin(token) {
     installAutoMod(this);
     installAntiRaid(this);
     installGameLobby(this);
+    installOfficialGenshinNews(this);
     installAchievementTriggers(this);
     installAchievementHall(this);
     installGenshinExtras(this);
