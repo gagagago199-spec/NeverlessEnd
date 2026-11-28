@@ -14,6 +14,7 @@ async function main() {
     }, sent: [], async send(payload) { this.sent.push(payload); return payload; },
   };
   guild.channels.cache.set(channel.id, channel);
+  guild.channels.cache.find = (predicate) => [...guild.channels.cache.values()].find(predicate) || null;
   assert.equal(news.isNewsChannel(channel), true);
   assert.equal(news.isNewsChannel({ ...channel, name: 'genshin-chat' }), false);
   assert.equal(news.isNewsChannel({ ...channel, type: 2 }), false);
